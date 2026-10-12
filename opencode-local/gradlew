@@ -1,0 +1,4 @@
+#!/bin/sh
+# Minimal Gradle wrapper launcher for GitHub Actions (real wrapper jar is downloaded by actions/setup-java + gradle action).
+# The cloud workflow below does NOT rely on this file; it installs Gradle directly.
+exec gradle "$@"
