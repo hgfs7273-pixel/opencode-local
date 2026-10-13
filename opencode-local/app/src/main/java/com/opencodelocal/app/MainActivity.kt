@@ -405,7 +405,7 @@ fun FilesScreen(sessionId: String, onBack: () -> Unit) {
         } else {
             LazyColumn(Modifier.padding(pad).padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 itemsIndexed(vm.diffs) { idx, d ->
-                    ElevatedCard(Modifier.fillMaxWidth(), onClick = { vm.expanded = if (vm.expanded == idx) null else idx }) {
+                    ElevatedCard(onClick = { vm.expanded = if (vm.expanded == idx) null else idx }, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(Icons.Default.Description, null)
