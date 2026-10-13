@@ -1,5 +1,7 @@
 package com.opencodelocal.app
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,9 +29,11 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.opencodelocal.app.backend.OpencodeBackend
 import com.opencodelocal.app.backend.OpencodeInstaller
+import com.opencodelocal.app.backend.Prefs
 import com.opencodelocal.app.ui.ChatViewModel
 import com.opencodelocal.app.ui.FilesViewModel
 import com.opencodelocal.app.ui.HomeViewModel
+import com.opencodelocal.app.ui.UpdateViewModel
 import com.opencodelocal.app.ui.fmtTime
 import com.opencodelocal.app.ui.theme.OpencodeLocalTheme
 import kotlinx.coroutines.launch
@@ -49,7 +53,12 @@ class MainActivity : ComponentActivity() {
                 val nav = rememberNavController()
                 NavHost(nav, startDestination = "setup") {
                     composable("setup") { SetupScreen { nav.navigate("home") } }
-                    composable("home") { HomeScreen(onOpen = { nav.navigate("chat/$it") }) }
+                    composable("home") {
+                        HomeScreen(
+                            onOpen = { nav.navigate("chat/$it") },
+                            onLogout = { nav.navigate("setup") { popUpTo("home") { inclusive = true } } }
+                        )
+                    }
                     composable(
                         "chat/{id}",
                         arguments = listOf(navArgument("id") { type = NavType.StringType })
@@ -87,12 +96,51 @@ fun <T : ViewModel> vmKey(key: String, create: () -> T): ViewModelProvider.Facto
 fun SetupScreen(onDone: () -> Unit) {
     val ctx = LocalContext.current
     val backend = remember { OpencodeBackend(ctx) }
+    val prefs = remember { Prefs(ctx) }
     val scope = rememberCoroutineScope()
-    var provider by remember { mutableStateOf("openai") }
+    var provider by remember { mutableStateOf(prefs.provider() ?: "openai") }
     var apiKey by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("尚未安裝") }
     var progress by remember { mutableStateOf(0) }
     var busy by remember { mutableStateOf(false) }
+    var autoTried by remember { mutableStateOf(false) }
+
+    fun startWith(p: String, k: String) {
+        busy = true
+        scope.launch {
+            if (!backend.isInstalled()) {
+                status = "下載本地引擎中…"
+                OpencodeInstaller(ctx, backend).install {
+                    when (it) {
+                        is OpencodeInstaller.Progress.Downloading -> { progress = it.percent; status = "下載中 ${it.percent}%" }
+                        is OpencodeInstaller.Progress.Extracting -> status = "解壓安裝中…"
+                        is OpencodeInstaller.Progress.Done -> status = "安裝完成，啟動中…"
+                        is OpencodeInstaller.Progress.Failed -> { status = "失敗：${it.reason}"; busy = false; return@install }
+                    }
+                }
+            }
+            status = "啟動本地後端…"
+            val ok = backend.startServer(k, p)
+            busy = false
+            if (ok) {
+                prefs.saveAuth(p, k)
+                onDone()
+            } else status = "啟動失敗，請重試（需 arm64 手機）"
+        }
+    }
+
+    // 記住 Key：每天打開自動啟動，不用重貼
+    LaunchedEffect(Unit) {
+        if (!autoTried) {
+            autoTried = true
+            val sp = prefs.provider()
+            val sk = prefs.apiKey()
+            if (!sp.isNullOrBlank() && !sk.isNullOrBlank()) {
+                status = "已記住 Key，自動啟動中…"
+                startWith(sp, sk)
+            }
+        }
+    }
 
     Scaffold(topBar = { TopAppBar(title = { Text("Opencode 本地版 · 設定") }) }) { pad ->
         Column(Modifier.padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -119,24 +167,7 @@ fun SetupScreen(onDone: () -> Unit) {
             Button(
                 onClick = {
                     if (apiKey.isBlank()) { status = "請先貼上 API Key"; return@Button }
-                    busy = true
-                    scope.launch {
-                        if (!backend.isInstalled()) {
-                            status = "下載本地引擎中…"
-                            OpencodeInstaller(ctx, backend).install {
-                                when (it) {
-                                    is OpencodeInstaller.Progress.Downloading -> { progress = it.percent; status = "下載中 ${it.percent}%" }
-                                    is OpencodeInstaller.Progress.Extracting -> status = "解壓安裝中…"
-                                    is OpencodeInstaller.Progress.Done -> status = "安裝完成，啟動中…"
-                                    is OpencodeInstaller.Progress.Failed -> { status = "失敗：${it.reason}"; busy = false; return@install }
-                                }
-                            }
-                        }
-                        status = "啟動本地後端…"
-                        val ok = backend.startServer(apiKey, provider)
-                        busy = false
-                        if (ok) onDone() else status = "啟動失敗，請重試（需 arm64 手機）"
-                    }
+                    startWith(provider, apiKey)
                 },
                 enabled = !busy,
                 modifier = Modifier.fillMaxWidth().height(56.dp)
@@ -153,9 +184,13 @@ fun SetupScreen(onDone: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(onOpen: (String) -> Unit) {
+fun HomeScreen(onOpen: (String) -> Unit, onLogout: () -> Unit) {
     val vm: HomeViewModel = viewModel()
-    val scope = rememberCoroutineScope()
+    val up: UpdateViewModel = viewModel()
+    val ctx = LocalContext.current
+    var menu by remember { mutableStateOf(false) }
+    var showEngine by remember { mutableStateOf(false) }
+    var showApp by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { vm.load() }
 
@@ -163,7 +198,24 @@ fun HomeScreen(onOpen: (String) -> Unit) {
         topBar = {
             TopAppBar(
                 title = { Text("我的任務") },
-                actions = { IconButton(onClick = { vm.load() }) { Icon(Icons.Default.Refresh, "重新整理") } }
+                actions = {
+                    IconButton(onClick = { vm.load() }) { Icon(Icons.Default.Refresh, "重新整理") }
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "更多") }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("更新引擎 / 查看版本") },
+                            onClick = { menu = false; showEngine = true; up.loadVersions() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("檢查 App 更新") },
+                            onClick = { menu = false; showApp = true; up.checkApp() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("登出（清除 Key）") },
+                            onClick = { menu = false; Prefs(ctx).clear(); onLogout() }
+                        )
+                    }
+                }
             )
         },
         floatingActionButton = {
@@ -208,6 +260,65 @@ fun HomeScreen(onOpen: (String) -> Unit) {
                 }
             }
         }
+    }
+
+    // ---- 引擎更新對話框 ----
+    if (showEngine) {
+        AlertDialog(
+            onDismissRequest = { if (!up.updating) showEngine = false },
+            title = { Text("引擎更新") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("已安裝：" + (up.engineVersion ?: "讀取中…"))
+                    Text("上游最新：" + (up.engineLatest ?: "讀取中…"))
+                    Text("更新只換引擎本體，你的程式碼和任務不會動。", style = MaterialTheme.typography.bodySmall)
+                    if (up.updating && up.updateProgress in 1..99) {
+                        LinearProgressIndicator(progress = { up.updateProgress / 100f }, modifier = Modifier.fillMaxWidth())
+                    }
+                    if (up.updateStatus.isNotBlank()) Text(up.updateStatus, style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { up.updateEngine() }, enabled = !up.updating) { Text("更新引擎") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEngine = false }, enabled = !up.updating) { Text("關閉") }
+            }
+        )
+    }
+
+    // ---- App 更新對話框 ----
+    if (showApp) {
+        val r = up.appResult
+        AlertDialog(
+            onDismissRequest = { showApp = false },
+            title = { Text("App 更新") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (r == null && up.checkingApp) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp)); Text("檢查中…")
+                        }
+                    } else if (r == null) {
+                        Text("檢查失敗，請稍後再試。")
+                    } else {
+                        Text("目前版本：" + r.current)
+                        Text("最新版本：" + (r.latest ?: "未知"))
+                        if (r.available) Text("有新版！按前往下載，覆蓋安裝即可，資料會保留。")
+                        else Text("已經是最新版。")
+                    }
+                }
+            },
+            confirmButton = {
+                if (r?.available == true && r.url != null) {
+                    TextButton(onClick = {
+                        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(r.url)))
+                    }) { Text("前往下載") }
+                }
+            },
+            dismissButton = { TextButton(onClick = { showApp = false }) { Text("關閉") } }
+        )
     }
 }
 
